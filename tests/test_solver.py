@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from solver import BLOCK, EMPTY, FLAMMABLE, COLOR_MIX, AkariSolver
+from solver import BLOCK, EMPTY, FLAMMABLE, COLOR_MIX, NUMBERED_BLOCKS, AkariSolver
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +441,140 @@ class TestAllCellsIlluminated:
 
 
 # ---------------------------------------------------------------------------
-# AkariSolver — display_solution (smoke test, no crash)
+# AkariSolver — numbered blocks (1–4 adjacent lights required)
 # ---------------------------------------------------------------------------
+
+
+class TestNumberedBlocks:
+    def test_numbered_block_is_a_block(self):
+        """Numbered blocks must block light and cannot hold lights themselves."""
+        grid = [[".", "2", "."]]
+        solver = AkariSolver(grid)
+        assert solver.is_block(0, 1)
+        assert solver.is_numbered_block(0, 1)
+        assert solver.numbered_block_value(0, 1) == 2
+
+    def test_light_cannot_be_placed_on_numbered_block(self):
+        grid = [["2"]]
+        solver = AkariSolver(grid)
+        assert not solver.can_place_light(0, 0, {})
+
+    def test_numbered_block_1_requires_exactly_one_adjacent_light(self):
+        """
+        1×3 row with a '1' block in the centre.
+        The block requires exactly one adjacent light (either (0,0) or (0,2)).
+        However, placing only one light leaves the far side unilluminated
+        (the '1' block itself blocks the beam), and placing both violates the
+        '1' constraint → no valid solution exists.
+        """
+        grid = [[".", "1", "."]]
+        solver = AkariSolver(grid)
+        solutions = solver.solve()
+        assert len(solutions) == 0
+
+    def test_numbered_block_0_equivalent_to_flammable_adjacency(self):
+        """
+        A '0' flammable block already prohibits any adjacent light; confirm
+        the numbered-block validation path also catches this via _is_valid_solution.
+        Note: '0' is handled as FLAMMABLE, not as a numbered block.
+        """
+        grid = [[".", "0", "."]]
+        solver = AkariSolver(grid)
+        solutions = solver.solve()
+        # Both adjacent cells are blocked from holding lights → no illumination → 0 solutions.
+        assert len(solutions) == 0
+
+    def test_numbered_block_2_requires_two_adjacent_lights(self):
+        """
+        3×3 grid with a '2' block in the centre.
+        Exactly two of the four orthogonal neighbours must hold lights.
+        """
+        grid = [
+            [".", ".", "."],
+            [".", "2", "."],
+            [".", ".", "."],
+        ]
+        solver = AkariSolver(grid)
+        solutions = solver.solve()
+        assert len(solutions) > 0
+        for sol in solutions:
+            adj = sum(
+                1
+                for (r, c) in sol
+                if (r, c) in {(0, 1), (1, 0), (1, 2), (2, 1)}
+            )
+            assert adj == 2, f"Expected 2 adjacent lights, got {adj} in {sol}"
+
+    def test_numbered_block_impossible_if_not_enough_adjacent_cells(self):
+        """
+        A '3' block in the corner has only 2 adjacent cells → impossible.
+        """
+        grid = [["3", "."], [".", "."]]
+        solver = AkariSolver(grid)
+        solutions = solver.solve()
+        assert len(solutions) == 0
+
+    def test_numbered_block_4_requires_all_four_adjacent_lights(self):
+        """
+        3×3 grid with a '4' block in the centre — all four orthogonal
+        neighbours must hold lights.
+
+        The '4' block itself separates (1,0) from (1,2) and (0,1) from (2,1),
+        so no fire-hazard exists between any pair of the four adjacent lights.
+        All corner cells are illuminated by the four lights.
+        Each of the four lights has 3 colour choices → 3^4 = 81 solutions.
+        """
+        grid = [
+            [".", ".", "."],
+            [".", "4", "."],
+            [".", ".", "."],
+        ]
+        solver = AkariSolver(grid)
+        solutions = solver.solve()
+        assert len(solutions) == 81
+        for sol in solutions:
+            adj = sum(
+                1
+                for (r, c) in sol
+                if (r, c) in {(0, 1), (1, 0), (1, 2), (2, 1)}
+            )
+            assert adj == 4, f"Expected 4 adjacent lights, got {adj} in {sol}"
+
+    def test_numbered_block_lights_do_not_block_each_other_when_separated(self):
+        """
+        A '2' block with '#' blocks above and below it.  The only cells
+        orthogonally adjacent to '2' are (1,0) and (1,2), so both must
+        hold lights.  The '2' block itself separates them → no fire hazard.
+        No additional lights can be placed anywhere (every other empty cell
+        sees (1,0) or (1,2) directly).  3 colour choices each → 9 solutions.
+        """
+        grid = [
+            [".", "#", "."],
+            [".", "2", "."],
+            [".", "#", "."],
+        ]
+        solver = AkariSolver(grid)
+        solutions = solver.solve()
+        assert len(solutions) == 9
+        for sol in solutions:
+            assert (1, 0) in sol and (1, 2) in sol, (
+                f"Expected lights at (1,0) and (1,2) only, got {sol}"
+            )
+
+    def test_is_numbered_block_false_for_other_cell_types(self):
+        grid = [[".", "#", "0"]]
+        solver = AkariSolver(grid)
+        assert not solver.is_numbered_block(0, 0)
+        assert not solver.is_numbered_block(0, 1)
+        assert not solver.is_numbered_block(0, 2)
+
+    def test_numbered_blocks_constant(self):
+        assert "1" in NUMBERED_BLOCKS
+        assert "2" in NUMBERED_BLOCKS
+        assert "3" in NUMBERED_BLOCKS
+        assert "4" in NUMBERED_BLOCKS
+        assert "#" not in NUMBERED_BLOCKS
+        assert "0" not in NUMBERED_BLOCKS
 
 
 class TestDisplaySolution:

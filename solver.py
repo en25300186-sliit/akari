@@ -7,6 +7,9 @@ Grid cell notation
 '#'  opaque block — blocks all light; no light may be placed here
 '0'  flammable block — blocks all light; no light may be placed in any of
      the four orthogonally adjacent cells
+'1'–'4'  numbered block — blocks all light; no light may be placed here;
+     exactly N of its orthogonally adjacent non-block cells must contain
+     a light.
 
 Light colors
 ------------
@@ -31,6 +34,8 @@ Rules
 4. Every non-block cell must be illuminated by at least one light.
 5. Cells listed in ``required_colors`` must be illuminated with exactly the
    specified mixed color.
+6. Each numbered block ('1'–'4') must have exactly that many lights placed
+   in its orthogonally adjacent (non-block) cells.
 """
 
 from __future__ import annotations
@@ -46,6 +51,9 @@ COLORS: Tuple[str, ...] = ("R", "G", "B")
 BLOCK = "#"
 FLAMMABLE = "0"
 EMPTY = "."
+
+# Numbered blocks '1'–'4': opaque blocks that require exactly N adjacent lights.
+NUMBERED_BLOCKS: FrozenSet[str] = frozenset({"1", "2", "3", "4"})
 
 # Required-color → component colors that must (and may only) illuminate a cell
 REQUIRED_COLOR_COMPONENTS: Dict[str, FrozenSet[str]] = {
@@ -110,11 +118,19 @@ class AkariSolver:
         return 0 <= r < self.rows and 0 <= c < self.cols
 
     def is_block(self, r: int, c: int) -> bool:
-        """Return True for any block type (opaque or flammable)."""
-        return self.grid[r][c] in (BLOCK, FLAMMABLE)
+        """Return True for any block type (opaque, flammable, or numbered)."""
+        return self.grid[r][c] in (BLOCK, FLAMMABLE) or self.grid[r][c] in NUMBERED_BLOCKS
 
     def is_flammable(self, r: int, c: int) -> bool:
         return self.grid[r][c] == FLAMMABLE
+
+    def is_numbered_block(self, r: int, c: int) -> bool:
+        """Return True iff the cell is a numbered block ('1'–'4')."""
+        return self.grid[r][c] in NUMBERED_BLOCKS
+
+    def numbered_block_value(self, r: int, c: int) -> int:
+        """Return the required adjacent-light count for a numbered block."""
+        return int(self.grid[r][c])
 
     # ------------------------------------------------------------------
     # Illumination helpers
@@ -223,10 +239,22 @@ class AkariSolver:
 
         * Every non-block cell is illuminated.
         * Every cell in ``required_colors`` displays the required colour.
+        * Every numbered block has exactly the required number of adjacent lights.
         """
         for r in range(self.rows):
             for c in range(self.cols):
                 if self.is_block(r, c):
+                    # Check numbered-block adjacency constraint.
+                    if self.is_numbered_block(r, c):
+                        required = self.numbered_block_value(r, c)
+                        adj = sum(
+                            1
+                            for dr, dc in DIRECTIONS
+                            if self.in_bounds(r + dr, c + dc)
+                            and (r + dr, c + dc) in lights
+                        )
+                        if adj != required:
+                            return False
                     continue
                 colors = self.get_illumination_colors(r, c, lights)
                 if not colors:
@@ -236,6 +264,45 @@ class AkariSolver:
                     actual = self.mix_color(colors)
                     if actual != req:
                         return False
+        return True
+
+    def _numbered_blocks_feasible(
+        self,
+        lights: Dict[Tuple[int, int], str],
+        decided: Set[Tuple[int, int]],
+    ) -> bool:
+        """
+        Pruning check for numbered blocks.
+
+        For each numbered block, count how many adjacent cells already have a
+        light (``adj_lights``) and how many adjacent cells are still undecided
+        (``adj_free``).  Prune if:
+
+        * ``adj_lights`` already exceeds the required count, or
+        * ``adj_lights + adj_free`` is less than the required count
+          (impossible to satisfy even with maximum future placements).
+        """
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if not self.is_numbered_block(r, c):
+                    continue
+                required = self.numbered_block_value(r, c)
+                adj_lights = 0
+                adj_free = 0
+                for dr, dc in DIRECTIONS:
+                    nr, nc = r + dr, c + dc
+                    if not self.in_bounds(nr, nc):
+                        continue
+                    if self.is_block(nr, nc):
+                        continue
+                    if (nr, nc) in lights:
+                        adj_lights += 1
+                    elif (nr, nc) not in decided:
+                        adj_free += 1
+                if adj_lights > required:
+                    return False
+                if adj_lights + adj_free < required:
+                    return False
         return True
 
     # ------------------------------------------------------------------
@@ -259,7 +326,7 @@ class AkariSolver:
             if not self.is_block(r, c)
         ]
         solutions: List[Dict[Tuple[int, int], str]] = []
-        self._backtrack(0, empty_cells, {}, solutions)
+        self._backtrack(0, empty_cells, {}, set(), solutions)
         return solutions
 
     def _backtrack(
@@ -267,6 +334,7 @@ class AkariSolver:
         idx: int,
         empty_cells: List[Tuple[int, int]],
         lights: Dict[Tuple[int, int], str],
+        decided: Set[Tuple[int, int]],
         solutions: List[Dict[Tuple[int, int], str]],
     ) -> None:
         if idx == len(empty_cells):
@@ -275,18 +343,26 @@ class AkariSolver:
             return
 
         r, c = empty_cells[idx]
+        decided.add((r, c))
 
         # Option A: leave this cell without its own light
-        self._backtrack(idx + 1, empty_cells, lights, solutions)
+        if self._numbered_blocks_feasible(lights, decided):
+            self._backtrack(idx + 1, empty_cells, lights, decided, solutions)
 
         # Options B–D: try placing each colour of light here
         if self.can_place_light(r, c, lights):
             for color in COLORS:
                 lights[(r, c)] = color
                 # Prune early if a required-colour cell is already violated
-                if self._required_colors_feasible(lights):
-                    self._backtrack(idx + 1, empty_cells, lights, solutions)
+                # or a numbered block constraint is already violated.
+                if (
+                    self._required_colors_feasible(lights)
+                    and self._numbered_blocks_feasible(lights, decided)
+                ):
+                    self._backtrack(idx + 1, empty_cells, lights, decided, solutions)
                 del lights[(r, c)]
+
+        decided.discard((r, c))
 
     # ------------------------------------------------------------------
     # Display
@@ -307,7 +383,9 @@ class AkariSolver:
         for r in range(self.rows):
             row_str = "|"
             for c in range(self.cols):
-                if self.is_flammable(r, c):
+                if self.is_numbered_block(r, c):
+                    row_str += f" {self.grid[r][c]} |"
+                elif self.is_flammable(r, c):
                     row_str += " F |"
                 elif self.is_block(r, c):
                     row_str += "###|"
@@ -320,7 +398,7 @@ class AkariSolver:
             print(row_str)
 
         print(f"{'=' * width}")
-        print("Legend: light=[R/G/B]  illuminated=(color)  block=###  flammable=F")
+        print("Legend: light=[R/G/B]  illuminated=(color)  block=###  flammable=F  numbered=[1-4]")
         if self.required_colors:
             fmt = {f"({r},{c})": v for (r, c), v in self.required_colors.items()}
             print(f"Required colours: {fmt}")

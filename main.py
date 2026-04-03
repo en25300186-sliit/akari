@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-from solver import BLOCK, COLORS, EMPTY, FLAMMABLE, AkariSolver
+from solver import BLOCK, COLORS, EMPTY, FLAMMABLE, NUMBERED_BLOCKS, AkariSolver
 
 # ---------------------------------------------------------------------------
 # Display helpers
@@ -52,6 +52,8 @@ def print_puzzle(
                 line += "###|"
             elif cell == FLAMMABLE:
                 line += " 0 |"
+            elif cell in NUMBERED_BLOCKS:
+                line += f" {cell} |"
             elif (r, c) in required_colors:
                 line += f"[{required_colors[(r, c)]}]|"
             else:
@@ -119,7 +121,8 @@ def interactive_setup() -> Tuple[List[List[str]], Dict[Tuple[int, int], str]]:
     # -- blocks ----------------------------------------------------------
     print("\n── Add blocks ─────────────────────────────────────────────")
     print("  '#'  opaque block    '0'  flammable block")
-    print("  Format: row col type   (1-based, e.g. '2 3 #')")
+    print("  '1'–'4'  numbered block (exactly N adjacent lights required)")
+    print("  Format: row col type   (1-based, e.g. '2 3 #'  or  '2 3 2')")
     print("  Type 'done' when finished.")
     while True:
         raw = input("  block> ").strip()
@@ -134,8 +137,8 @@ def interactive_setup() -> Tuple[List[List[str]], Dict[Tuple[int, int], str]]:
             print(f"  ✗ Position out of bounds (rows 1–{rows}, cols 1–{cols}).")
             continue
         btype = parts[2]
-        if btype not in ("#", "0"):
-            print("  ✗ Block type must be '#' or '0'.")
+        if btype not in ("#", "0", "1", "2", "3", "4"):
+            print("  ✗ Block type must be '#', '0', '1', '2', '3', or '4'.")
             continue
         grid[pos[0]][pos[1]] = btype
         print_puzzle(grid, required_colors)
@@ -267,15 +270,44 @@ def _example_3() -> None:
     solve_and_display(grid, required, max_display=5)
 
 
+def _example_4() -> None:
+    """
+    3×3 grid with numbered blocks, an opaque block, and required colours.
+
+    '2' blocks mandate exactly 2 adjacent lights each.  The '#' in the centre
+    prevents the four adjacent lights (two per '2' block) from seeing one
+    another (fire hazard).
+
+    Grid layout (2 = numbered block, # = opaque block):
+        2  .  .
+        .  #  .
+        .  .  2
+
+    Required: cell (0,2) must be Red; cell (2,0) must be Green.
+
+    The unique solution is:
+        (0,1)=R  (1,0)=G  (1,2)=R  (2,1)=G
+    """
+    print("\n=== Example 4: 3×3 — numbered blocks with required colours ===")
+    grid = [
+        ["2", ".", "."],
+        [".", "#", "."],
+        [".", ".", "2"],
+    ]
+    required = {(0, 2): "R", (2, 0): "G"}
+    solve_and_display(grid, required, max_display=5)
+
+
 EXAMPLES = {
     "1": _example_1,
     "2": _example_2,
     "3": _example_3,
+    "4": _example_4,
 }
 
 
 def run_example(name: str) -> None:
-    """Run one of the built-in example puzzles by name ('1', '2', or '3')."""
+    """Run one of the built-in example puzzles by name ('1', '2', '3', or '4')."""
     fn = EXAMPLES.get(str(name))
     if fn is None:
         print(f"Unknown example '{name}'. Available: {list(EXAMPLES)}")
@@ -297,7 +329,7 @@ def main() -> None:
     choice = input("\nChoice (1/2): ").strip()
 
     if choice == "2":
-        print("\nAvailable examples: 1, 2, 3")
+        print("\nAvailable examples: 1, 2, 3, 4")
         ex = input("Which example? ").strip()
         run_example(ex)
     else:

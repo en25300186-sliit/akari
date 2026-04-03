@@ -306,6 +306,298 @@ class AkariSolver:
         return True
 
     # ------------------------------------------------------------------
+    # Additional pruning helpers
+    # ------------------------------------------------------------------
+
+    def _can_be_illuminated(
+        self,
+        r: int,
+        c: int,
+        lights: Dict[Tuple[int, int], str],
+        decided: Set[Tuple[int, int]],
+    ) -> bool:
+        """
+        Return True iff ``(r, c)`` is either already illuminated or has at
+        least one undecided (not yet committed) cell in one of its four
+        sight-line segments — meaning a future light could still reach it.
+        """
+        if self.get_illumination_colors(r, c, lights):
+            return True
+        for dr, dc in DIRECTIONS:
+            nr, nc = r + dr, c + dc
+            while self.in_bounds(nr, nc) and not self.is_block(nr, nc):
+                if (nr, nc) not in decided:
+                    return True
+                nr += dr
+                nc += dc
+        return False
+
+    def _illumination_feasible_after_no_light(
+        self,
+        r: int,
+        c: int,
+        lights: Dict[Tuple[int, int], str],
+        decided: Set[Tuple[int, int]],
+    ) -> bool:
+        """
+        After committing ``(r, c)`` to *no light*, verify that:
+
+        1. ``(r, c)`` itself can still be illuminated (own light is off the
+           table, so it needs a light elsewhere in its sight).
+        2. Every decided-no-light cell that can see ``(r, c)`` can still be
+           illuminated (``(r, c)`` is no longer an available light source for
+           them, narrowing their options).
+        """
+        if not self._can_be_illuminated(r, c, lights, decided):
+            return False
+        for dr, dc in DIRECTIONS:
+            nr, nc = r + dr, c + dc
+            while self.in_bounds(nr, nc) and not self.is_block(nr, nc):
+                if (nr, nc) in decided and (nr, nc) not in lights:
+                    if not self._can_be_illuminated(nr, nc, lights, decided):
+                        return False
+                nr += dr
+                nc += dc
+        return True
+
+    def _required_colors_satisfiable(
+        self,
+        lights: Dict[Tuple[int, int], str],
+        decided: Set[Tuple[int, int]],
+    ) -> bool:
+        """
+        For every required-colour cell whose target is not yet fully achieved,
+        verify that at least one undecided cell exists in its sight lines so
+        that the missing component colour(s) could still be provided.
+
+        Also checks that current illumination does not already contain a colour
+        outside the target set (which can never be undone).
+        """
+        for (r, c), req in self.required_colors.items():
+            req_set = REQUIRED_COLOR_COMPONENTS.get(req, frozenset())
+            current = self.get_illumination_colors(r, c, lights)
+
+            # Wrong colour already present — unrecoverable.
+            if not current.issubset(req_set):
+                return False
+
+            needed = req_set - current
+            if not needed:
+                continue  # Already fully satisfied.
+
+            # Need more colours: there must be at least one undecided cell in
+            # the sight lines (including the cell itself) that could supply them.
+            has_undecided = (r, c) not in decided
+            if not has_undecided:
+                for dr, dc in DIRECTIONS:
+                    nr, nc = r + dr, c + dc
+                    while self.in_bounds(nr, nc) and not self.is_block(nr, nc):
+                        if (nr, nc) not in decided:
+                            has_undecided = True
+                            break
+                        nr += dr
+                        nc += dc
+                    if has_undecided:
+                        break
+            if not has_undecided:
+                return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Constraint propagation helpers
+    # ------------------------------------------------------------------
+
+    def _compute_forbidden(self) -> Set[Tuple[int, int]]:
+        """Return the set of empty cells that must never hold a light
+        (i.e. they are orthogonally adjacent to a flammable block)."""
+        forbidden: Set[Tuple[int, int]] = set()
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if self.is_block(r, c):
+                    continue
+                for dr, dc in DIRECTIONS:
+                    nr, nc = r + dr, c + dc
+                    if self.in_bounds(nr, nc) and self.is_flammable(nr, nc):
+                        forbidden.add((r, c))
+                        break
+        return forbidden
+
+    def _mark_fire_hazard(
+        self,
+        r: int,
+        c: int,
+        lights: Dict[Tuple[int, int], str],
+        decided: Set[Tuple[int, int]],
+    ) -> None:
+        """After placing a light at ``(r, c)``, mark every other cell in its
+        four sight-line segments as decided-no-light (fire hazard)."""
+        for dr, dc in DIRECTIONS:
+            nr, nc = r + dr, c + dc
+            while self.in_bounds(nr, nc) and not self.is_block(nr, nc):
+                decided.add((nr, nc))  # no-light (not added to lights)
+                nr += dr
+                nc += dc
+
+    def _propagate(
+        self,
+        lights: Dict[Tuple[int, int], str],
+        decided: Set[Tuple[int, int]],
+        forbidden: Set[Tuple[int, int]],
+    ) -> bool:
+        """
+        Apply constraint propagation until a fixpoint is reached.
+
+        Propagation rules applied repeatedly:
+
+        1. **Required-colour unit rule** — for each required-colour cell that
+           still needs a colour component *k*, collect every undecided,
+           non-forbidden cell visible from it (including itself) whose
+           placement of colour *k* is not immediately blocked by a fire hazard.
+           If there is exactly *one* such candidate, force colour *k* there.
+           If there are *zero* candidates, return ``False`` (contradiction).
+
+        2. **Illumination unit rule** — for each undecided non-block cell that
+           is not yet illuminated, collect every undecided cell (including
+           itself) that could illuminate it (i.e. is in one of its four sight
+           segments and is not forbidden).  If there is exactly *one* such
+           candidate, force *some* light there.  If colour is already pinned
+           by a required-colour constraint at that candidate, use that colour;
+           otherwise we cannot fix the colour yet (skip forcing—colour will be
+           resolved by other rules or backtracking).
+
+        3. **Feasibility checks** — after every forced placement propagate the
+           fire-hazard constraint and verify that no required-colour cell has
+           already received a wrong colour.
+
+        Modifies *lights* and *decided* in place.  Returns ``True`` if
+        consistent so far, ``False`` if a contradiction has been found.
+        """
+        changed = True
+        while changed:
+            changed = False
+
+            # ---- Rule 1: required-colour unit propagation ----
+            for (r, c), req in self.required_colors.items():
+                req_set = REQUIRED_COLOR_COMPONENTS.get(req, frozenset())
+                current = self.get_illumination_colors(r, c, lights)
+
+                if not current.issubset(req_set):
+                    return False  # wrong colour already present
+
+                needed = req_set - current
+                for color in list(needed):
+                    # Find undecided non-forbidden candidates for this colour.
+                    candidates: List[Tuple[int, int]] = []
+
+                    # Cell (r,c) itself as a candidate.
+                    if (
+                        (r, c) not in decided
+                        and (r, c) not in forbidden
+                        and not self.lights_in_sight(r, c, lights)
+                    ):
+                        candidates.append((r, c))
+
+                    for dr, dc in DIRECTIONS:
+                        nr, nc = r + dr, c + dc
+                        while self.in_bounds(nr, nc) and not self.is_block(nr, nc):
+                            if (
+                                (nr, nc) not in decided
+                                and (nr, nc) not in forbidden
+                                and not self.lights_in_sight(nr, nc, lights)
+                            ):
+                                candidates.append((nr, nc))
+                            nr += dr
+                            nc += dc
+
+                    if not candidates:
+                        return False  # no way to supply this colour
+
+                    if len(candidates) == 1:
+                        pos = candidates[0]
+                        pr, pc = pos
+                        # Conflict: pos already has a different colour?
+                        if pos in lights:
+                            if lights[pos] != color:
+                                return False
+                            # Already set correctly — nothing to do.
+                        else:
+                            # Force placement.
+                            lights[pos] = color
+                            decided.add(pos)
+                            self._mark_fire_hazard(pr, pc, lights, decided)
+                            changed = True
+
+                            # Verify no required-colour cell is contaminated.
+                            if not self._required_colors_feasible(lights):
+                                return False
+
+            # ---- Rule 2: illumination unit propagation ----
+            for r in range(self.rows):
+                for c in range(self.cols):
+                    if self.is_block(r, c):
+                        continue
+                    if (r, c) in decided:
+                        # Already decided; just verify it's illuminated if no-light.
+                        if (r, c) not in lights:
+                            if not self.get_illumination_colors(r, c, lights):
+                                # Decided no-light but dark — contradiction only if
+                                # no undecided cell can still reach it.
+                                if not self._can_be_illuminated(r, c, lights, decided):
+                                    return False
+                        continue
+
+                    # Undecided cell — find all possible illumination sources.
+                    sources: List[Tuple[int, int]] = []
+                    if (r, c) not in forbidden:
+                        sources.append((r, c))
+                    for dr, dc in DIRECTIONS:
+                        nr, nc = r + dr, c + dc
+                        while self.in_bounds(nr, nc) and not self.is_block(nr, nc):
+                            if (nr, nc) not in decided and (nr, nc) not in forbidden:
+                                sources.append((nr, nc))
+                            nr += dr
+                            nc += dc
+
+                    # Already illuminated by an existing light — fine.
+                    if self.get_illumination_colors(r, c, lights):
+                        continue
+
+                    if not sources:
+                        return False  # Can never be illuminated.
+
+                    if len(sources) == 1:
+                        pos = sources[0]
+                        pr, pc = pos
+                        if pos in lights:
+                            continue  # already a light here, illumination satisfied
+
+                        # Determine colour: if (pos) is a required-colour cell
+                        # and that colour is a single primary, use it; otherwise
+                        # we need backtracking to choose a colour — skip for now.
+                        forced_color: Optional[str] = None
+                        if pos in self.required_colors:
+                            req = self.required_colors[pos]
+                            comps = REQUIRED_COLOR_COMPONENTS.get(req, frozenset())
+                            if len(comps) == 1:
+                                forced_color = next(iter(comps))
+
+                        if forced_color is not None and pos not in forbidden:
+                            lights[pos] = forced_color
+                            decided.add(pos)
+                            self._mark_fire_hazard(pr, pc, lights, decided)
+                            changed = True
+                            if not self._required_colors_feasible(lights):
+                                return False
+
+            # ---- Sanity: required-colour feasibility ----
+            if not self._required_colors_feasible(lights):
+                return False
+            if not self._numbered_blocks_feasible(lights, decided):
+                return False
+
+        return True
+
+    # ------------------------------------------------------------------
     # Back-tracking search
     # ------------------------------------------------------------------
 
@@ -319,50 +611,117 @@ class AkariSolver:
             Each dict maps ``(row, col)`` → colour string for every light
             placed in that solution.
         """
-        empty_cells: List[Tuple[int, int]] = [
-            (r, c)
-            for r in range(self.rows)
-            for c in range(self.cols)
-            if not self.is_block(r, c)
-        ]
+        forbidden = self._compute_forbidden()
+
+        # Seed state.
+        lights: Dict[Tuple[int, int], str] = {}
+        decided: Set[Tuple[int, int]] = set()
+
+        # Apply propagation before any backtracking.
+        if not self._propagate(lights, decided, forbidden):
+            return []
+
         solutions: List[Dict[Tuple[int, int], str]] = []
-        self._backtrack(0, empty_cells, {}, set(), solutions)
+        self._backtrack_propagate(lights, decided, forbidden, solutions)
         return solutions
 
-    def _backtrack(
+    def _choose_cell(
         self,
-        idx: int,
-        empty_cells: List[Tuple[int, int]],
         lights: Dict[Tuple[int, int], str],
         decided: Set[Tuple[int, int]],
+        forbidden: Set[Tuple[int, int]],
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Pick the next undecided cell to branch on using a
+        minimum-remaining-values (MRV) heuristic.
+
+        Priority (ascending sort key → pick smallest):
+
+        1. Required-colour cells that are not yet fully satisfied come first
+           (they carry the most information).
+        2. Among equal priority, prefer cells with fewer potential light
+           sources in their sight lines (most-constrained-variable).
+        """
+        best: Optional[Tuple[int, int]] = None
+        best_key: tuple = (10, 10**9)
+
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if self.is_block(r, c) or (r, c) in decided:
+                    continue
+
+                # Priority 0 = required-colour not yet satisfied, 1 = other.
+                is_req = (r, c) in self.required_colors
+                if is_req:
+                    req_set = REQUIRED_COLOR_COMPONENTS.get(
+                        self.required_colors[(r, c)], frozenset()
+                    )
+                    current = self.get_illumination_colors(r, c, lights)
+                    priority = 0 if req_set - current else 1
+                else:
+                    priority = 1
+
+                # Count undecided non-forbidden potential illumination sources.
+                sources = 0
+                if (r, c) not in forbidden:
+                    sources += 1
+                for dr, dc in DIRECTIONS:
+                    nr, nc = r + dr, c + dc
+                    while self.in_bounds(nr, nc) and not self.is_block(nr, nc):
+                        if (nr, nc) not in decided and (nr, nc) not in forbidden:
+                            sources += 1
+                        nr += dr
+                        nc += dc
+
+                key = (priority, sources)
+                if key < best_key:
+                    best_key = key
+                    best = (r, c)
+
+        return best
+
+    def _backtrack_propagate(
+        self,
+        lights: Dict[Tuple[int, int], str],
+        decided: Set[Tuple[int, int]],
+        forbidden: Set[Tuple[int, int]],
         solutions: List[Dict[Tuple[int, int], str]],
     ) -> None:
-        if idx == len(empty_cells):
+        """Backtracking search with propagation at every node."""
+        cell = self._choose_cell(lights, decided, forbidden)
+
+        if cell is None:
+            # All cells decided — verify and record.
             if self._is_valid_solution(lights):
                 solutions.append(dict(lights))
             return
 
-        r, c = empty_cells[idx]
-        decided.add((r, c))
+        r, c = cell
 
-        # Option A: leave this cell without its own light
-        if self._numbered_blocks_feasible(lights, decided):
-            self._backtrack(idx + 1, empty_cells, lights, decided, solutions)
+        # ---- Option A: no light at (r, c) ----
+        decided_a = set(decided)
+        decided_a.add((r, c))
+        lights_a = dict(lights)
+        if (
+            self._illumination_feasible_after_no_light(r, c, lights_a, decided_a)
+            and self._propagate(lights_a, decided_a, forbidden)
+        ):
+            self._backtrack_propagate(lights_a, decided_a, forbidden, solutions)
 
-        # Options B–D: try placing each colour of light here
+        # ---- Options B–D: place a light at (r, c) ----
         if self.can_place_light(r, c, lights):
             for color in COLORS:
-                lights[(r, c)] = color
-                # Prune early if a required-colour cell is already violated
-                # or a numbered block constraint is already violated.
-                if (
-                    self._required_colors_feasible(lights)
-                    and self._numbered_blocks_feasible(lights, decided)
-                ):
-                    self._backtrack(idx + 1, empty_cells, lights, decided, solutions)
-                del lights[(r, c)]
+                lights_b = dict(lights)
+                lights_b[(r, c)] = color
+                decided_b = set(decided)
+                decided_b.add((r, c))
+                self._mark_fire_hazard(r, c, lights_b, decided_b)
 
-        decided.discard((r, c))
+                if (
+                    self._required_colors_feasible(lights_b)
+                    and self._propagate(lights_b, decided_b, forbidden)
+                ):
+                    self._backtrack_propagate(lights_b, decided_b, forbidden, solutions)
 
     # ------------------------------------------------------------------
     # Display
